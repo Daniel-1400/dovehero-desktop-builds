@@ -1,0 +1,121 @@
+name: Release desktop
+
+# Builds a tagged version of the private source repo and attaches the installers to a
+# DRAFT release in this repo (drafts are visible to collaborators only). This repo is
+# public only so Actions minutes are free; it contains no application source.
+#
+# Secrets:
+#   SOURCE_DEPLOY_KEY                    read-only deploy key on skycommerce/dovehero-tracker
+#   TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) updater signature (matches plugins.updater.pubkey)
+#   APPLE_* (optional)                   macOS signing / notarization
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build (source tag desktop-v<version>, e.g. 1.0.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  DOVEHERO_BACKEND_URL: https://api-tracker.dovehero.ai
+  DOVEHERO_WEB_URL: https://tracker.dovehero.ai
+  # Keep source lines out of the public log: compiler warnings quote code.
+  RUSTFLAGS: -Awarnings
+
+concurrency:
+  group: release-desktop-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: windows-latest
+            args: ''
+            rust_targets: ''
+          - platform: ubuntu-24.04
+            args: '--bundles appimage,deb'
+            rust_targets: ''
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: skycommerce/dovehero-tracker
+          ref: desktop-v${{ inputs.version }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'pnpm' }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: '${{ matrix.rust_targets }}' }
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: 'apps/desktop/src-tauri -> target' }
+
+      - name: Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev patchelf libdbus-1-dev libpipewire-0.3-dev libgbm-dev \
+            libegl-dev libxcb1-dev libxrandr-dev libwayland-dev clang
+
+      - run: pnpm install --frozen-lockfile --filter @dovehero/desktop...
+
+      # Tauri treats a set-but-empty env var as configured, so export only the
+      # secrets that exist and fall back to an unsigned build for the rest.
+      - name: Signing env + config overrides
+        id: cfg
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+                   TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ -n "${!v}" ]; then
+              { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
+            fi
+          done
+          mac='{}'; upd='{}'
+          if [ "$RUNNER_OS" = macOS ] && [ -z "$APPLE_CERTIFICATE" ]; then
+            mac='{"macOS":{"signingIdentity":"-"}}'
+            echo "::warning::APPLE_CERTIFICATE not set — macOS build is ad-hoc signed, not notarized"
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            upd='{"createUpdaterArtifacts":false}'
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY not set — no auto-update artifacts"
+          fi
+          jq -n --argjson m "$mac" --argjson u "$upd" --arg ep "$DOVEHERO_BACKEND_URL/download/latest.json" \
+            '{bundle: ($m + $u), plugins: {updater: {endpoints: [$ep]}}}' > "$RUNNER_TEMP/ci.conf.json"
+          echo "path=$RUNNER_TEMP/ci.conf.json" >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          args: ${{ matrix.args }} --config ${{ steps.cfg.outputs.path }}
+          tagName: desktop-v__VERSION__
+          releaseName: DoveHero Tracker v__VERSION__
+          releaseBody: Installers for DoveHero Tracker v__VERSION__.
+          releaseDraft: true
+          prerelease: false
