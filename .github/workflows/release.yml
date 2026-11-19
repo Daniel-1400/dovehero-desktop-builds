@@ -8,6 +8,8 @@ name: Release desktop
 #   SOURCE_DEPLOY_KEY                    read-only deploy key on skycommerce/dovehero-tracker
 #   TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) updater signature (matches plugins.updater.pubkey)
 #   APPLE_* (optional)                   macOS signing / notarization
+#   AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET (optional) Windows signing; also needs repo
+#                                        variable AZURE_SIGNING_PROFILE
 on:
   workflow_dispatch:
     inputs:
@@ -72,6 +74,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile --filter @dovehero/desktop...
 
+      # Windows Authenticode via Azure Artifact (Trusted) Signing. Off until the repo
+      # variable AZURE_SIGNING_PROFILE is set (the certificate profile exists).
+      - name: Install trusted-signing-cli
+        if: runner.os == 'Windows' && vars.AZURE_SIGNING_PROFILE != ''
+        run: cargo install trusted-signing-cli --locked
+
       # Tauri treats a set-but-empty env var as configured, so export only the
       # secrets that exist and fall back to an unsigned build for the rest.
       - name: Signing env + config overrides
@@ -86,25 +94,41 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Windows signing (Entra app with "Artifact Signing Certificate Profile Signer")
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT || 'https://neu.codesigning.azure.net' }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT || 'dovehero-signing' }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
         run: |
           for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
                    APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
-                   TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+                   TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+                   AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET; do
             if [ -n "${!v}" ]; then
               { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
             fi
           done
-          mac='{}'; upd='{}'
+          mac='{}'; win='{}'; upd='{}'
           if [ "$RUNNER_OS" = macOS ] && [ -z "$APPLE_CERTIFICATE" ]; then
             mac='{"macOS":{"signingIdentity":"-"}}'
             echo "::warning::APPLE_CERTIFICATE not set — macOS build is ad-hoc signed, not notarized"
+          fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            if [ -n "$AZURE_SIGNING_PROFILE" ] && [ -n "$AZURE_CLIENT_SECRET" ]; then
+              cmd="trusted-signing-cli -e $AZURE_SIGNING_ENDPOINT -a $AZURE_SIGNING_ACCOUNT -c $AZURE_SIGNING_PROFILE -d DoveHeroTracker %1"
+              win=$(jq -n --arg c "$cmd" '{windows:{signCommand:$c}}')
+            else
+              echo "::warning::AZURE_SIGNING_PROFILE or Azure secrets not set — Windows build is unsigned"
+            fi
           fi
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             upd='{"createUpdaterArtifacts":false}'
             echo "::warning::TAURI_SIGNING_PRIVATE_KEY not set — no auto-update artifacts"
           fi
-          jq -n --argjson m "$mac" --argjson u "$upd" --arg ep "$DOVEHERO_BACKEND_URL/download/latest.json" \
-            '{bundle: ($m + $u), plugins: {updater: {endpoints: [$ep]}}}' > "$RUNNER_TEMP/ci.conf.json"
+          jq -n --argjson m "$mac" --argjson w "$win" --argjson u "$upd" --arg ep "$DOVEHERO_BACKEND_URL/download/latest.json" \
+            '{bundle: ($m + $w + $u), plugins: {updater: {endpoints: [$ep]}}}' > "$RUNNER_TEMP/ci.conf.json"
           echo "path=$RUNNER_TEMP/ci.conf.json" >> "$GITHUB_OUTPUT"
 
       - uses: tauri-apps/tauri-action@v0
